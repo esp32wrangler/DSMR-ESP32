@@ -30,3 +30,15 @@ bool isOBIS(char c)
 {
     return (c == '.' || c == ':' || c == '-' || (c >= '0' && c <= '9'));
 }
+
+bool isNumeric(const char * ptr)
+{
+    do
+    {
+        if (! ((*ptr >= '0' && *ptr <= '9') || *ptr == '.') )
+        {
+            return false;   
+        }
+    } while (*++ptr);
+    return true;
+}

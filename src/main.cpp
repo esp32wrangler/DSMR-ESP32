@@ -6,6 +6,7 @@
 #include "decoder.h"
 #include "utils.h"
 #include "secrets.h"
+#include <esp_task_wdt.h>
 
 #include <TFT_eSPI.h>                 // Include the graphics library (this includes the sprite functions)
 
@@ -17,6 +18,8 @@ TFT_eSPI    tft = TFT_eSPI();
 #define GMT_OFFSET_SEC 3600
 
 const char * MQTT_TOPIC ("p1meter");
+const char * MQTT_DEBUG_TOPIC ("debug");
+#define WDT_TIMEOUT 30
 
 TMeterValues g_meter_values;
 
@@ -62,17 +65,17 @@ unsigned long lastMsg = 0;
 char msg[MSG_BUFFER_SIZE];
 int value = 0;
 
-bool g_screenState = true;
+bool g_screenState = false;
 
 
 
 #define PIN_SERIAL_RX 13
-#define PIN_SERIAL_TX 15
+#define PIN_SERIAL_TX 17
 
 void setDateTime() {
   // You can use your own timezone, but the exact time is not used at all.
   // Only the date is needed for validating the certificates.
-  configTime(GMT_OFFSET_SEC, 3600, "hu.pool.ntp.org", "time.kfki.hu");
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "hu.pool.ntp.org", "time.google.com");
 
   Serial.print("Waiting for NTP time sync: ");
   time_t now = time(nullptr);
@@ -94,30 +97,44 @@ void setDateTime() {
   Serial.printf("%s", asctime(&timeinfo));
 }
 
+void send_debug(const char * msg);
+
+int first_connect = true;
+
 void reconnect() {
   int attempts = 0;
   // Loop until we’re reconnected
   while (!socketClient.connected()) {
-    if (attempts > 20)
-    {
-      ESP.restart();
-    }
-    String clientId = "ESP32Client - DSMR999";
+    String clientId = "basicPubSub";
     // Attempt to connect
     // Insert your password
-    if (mqttClient.connect(clientId.c_str(), "test1", HIVEMQ_PWD)) {
-      Serial.println("mqtt connected");
+    //if (mqttClient.connect(clientId.c_str(), "test1", HIVEMQ_PWD)) {
+    if (mqttClient.connect(clientId.c_str())) {
+      if (first_connect)
+      {
+        first_connect = false;
+        send_debug("mqtt first connect");
+      }
+      else
+      {
+        send_debug("mqtt reconnected");
+      }
     } else {
       Serial.print("failed, rc = ");
       Serial.print(mqttClient.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      attempts++;
-      delay(5000);
+      Serial.println(" restart");
+      if (attempts++ == 10)
+      {
+       ESP.restart();
+      }
+      esp_task_wdt_reset();
+      delay(3000);
 
     }
   }
 }
+
+
 
 void setup() {
   pinMode(35, INPUT);
@@ -133,10 +150,17 @@ void setup() {
   tft.setTextColor(TFT_WHITE,TFT_BLACK);
   tft.setTextSize(1);
 
+  digitalWrite(TFT_BL, g_screenState);
+
+  int attempts = 0;
   tft.println("Connecting to Wifi...");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.println("Connecting to WiFi..");
+    if (attempts++ == 60)
+    {
+      ESP.restart();
+    }
   }
 
   Serial.println("");
@@ -150,12 +174,16 @@ void setup() {
  
   randomSeed(esp_random());
 
+  socketClient.setCertificate(p1meter_cert);
+  socketClient.setPrivateKey(p1meter_private_key);
+  socketClient.setCACert(aws_cert);
+
   //espClient.setCACert(rootCA_cert);
   //espClient.setCACert((const char *)rootca_pem_crt_start);
 
   //Serial.printf("CA address %x %s", &rootca_pem_crt_start, rootca_pem_crt_start);
 
-  socketClient.setCACertBundle(rootca_crt_bundle_start);
+  //socketClient.setCACertBundle(rootca_crt_bundle_start);
 
   //Serial.printf("CA address %x", &rootCA_cert);
   //Serial.printf("CA address %x %s", &rootca_crt_start, rootca_crt_start);
@@ -171,6 +199,8 @@ void setup() {
   mqttClient.setServer(mqtt_server, 8883);
   mqttClient.setBufferSize(1500);
   
+  esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
+  esp_task_wdt_add(NULL); //add current thread to WDT watch*/
 }
 
 void send_mqtt_message (const char* topic, const char * message)
@@ -183,9 +213,38 @@ void send_mqtt_message (const char* topic, const char * message)
 
 void send_debug(const char * msg)
 {
-  send_mqtt_message("debug", msg);
+  String jsonmsg("{\"message\": \"");
+  jsonmsg.concat(msg);
+  jsonmsg.concat("\"}");
+  send_mqtt_message(MQTT_DEBUG_TOPIC, jsonmsg.c_str());
 }
 
+std::vector<std::pair<const char*, int>> date_map = 
+{
+  {"date_yr", 0},
+  {"date_mo", 2},
+  {"date_day", 4},
+  {"time_h", 6},
+  {"time_m", 8},
+  {"time_s", 10}
+};
+
+void unpack_date()
+{
+  for (auto meter_value : g_meter_values)
+  {
+    if (strcmp(meter_value.first, "date") == 0) {
+      char buf[] = "..";
+      for (auto elem : date_map)
+      {
+        buf[0] = meter_value.second[elem.second];
+        buf[1] = meter_value.second[elem.second+1];
+        g_meter_values.push_back({elem.first, buf});
+      }
+      g_meter_values.push_back({"date_dst", meter_value.second[12] == 'S'?"1":"0"});
+    }
+  }
+}
 
 void send_meter_values()
 {
@@ -202,7 +261,34 @@ void send_meter_values()
     {
       first = false;
     }
-    ptr += sprintf (ptr, "  \"%s\": %s", meter_value.first, meter_value.second.c_str());
+
+    const char * nzptr = meter_value.second.c_str();
+
+    do
+    {
+      if (*nzptr != '0')
+      {
+        break;
+      } 
+      else
+      {
+        char next = *(nzptr+1);
+        if (next == '.' || next == 0)
+        {
+          break;
+        }
+      }
+    } while(*++nzptr);
+
+    if (isNumeric(nzptr))
+    {
+      ptr += sprintf (ptr, "  \"%s\": %s", meter_value.first, nzptr);
+    }
+    else
+    {
+      ptr += sprintf (ptr, "  \"%s\": \"%s\"", meter_value.first, nzptr);
+    }
+
   }
   sprintf(ptr, "\n}");
   send_mqtt_message(MQTT_TOPIC, buf);
@@ -212,10 +298,12 @@ void send_meter_values()
 void testlayout()
 {
   g_meter_values.clear();
-  g_meter_values.push_back({"presentConsumption_kWh", "101010.111"});
+    g_meter_values.push_back({"date", "220114103300W"});
+
+  g_meter_values.push_back({"presentConsumption_kWh", "000000.111"});
   g_meter_values.push_back({"presentReturn_kWh", "202020.222"});
   g_meter_values.push_back({"frequency_Hz", "49.85"});
-  g_meter_values.push_back({"L1current_A", "001"});
+  g_meter_values.push_back({"L1current_A", "000"});
   g_meter_values.push_back({"L1voltage_V", "231.23"});
   g_meter_values.push_back({"L1phase", "0.198"});
   g_meter_values.push_back({"L2current_A", "002"});
@@ -225,7 +313,9 @@ void testlayout()
   g_meter_values.push_back({"L3voltage_V", "233.45"});
   g_meter_values.push_back({"L3phase","0.345"});
   update_screen(g_meter_values, tft);
+  unpack_date();
   send_meter_values();
+  send_debug("testlayout has been done");
   delay(100000);
 }
 
@@ -245,6 +335,7 @@ void screenButtonLoop()
 }
 
 
+
 void loop() {
 
   #define MAX_LINE_LEN 1050
@@ -253,6 +344,8 @@ void loop() {
   static unsigned int heartBeatChar = 0;
 
   screenButtonLoop();
+
+  esp_task_wdt_reset();
 
   if (g_screenState)
   {
@@ -274,7 +367,7 @@ void loop() {
 
   mqttClient.loop();
 
-  //testlayout();
+//  testlayout();
 
 
   if (Serial2.available())
@@ -288,6 +381,7 @@ void loop() {
 //        send_debug(linebuffer);
         if (decode_telegram(linebuffer, len, g_meter_values))
         {
+          unpack_date();
           send_meter_values();
           if (g_screenState)
           {
